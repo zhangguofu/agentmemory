@@ -483,7 +483,11 @@ async function maybeOfferGlobalInstall(): Promise<void> {
 // "is it listening?" is the wrong question at boot time).
 type IiiConsoleState =
   | { kind: "installed"; binPath: string }
-  | { kind: "missing" };
+  | { kind: "running"; binPath: string; port: number; pid: number }
+  | { kind: "missing" }
+  | { kind: "error"; message: string };
+
+let iiiConsoleProcess: ChildProcess | null = null;
 
 function detectIiiConsole(): IiiConsoleState {
   const onPath = whichBinary("iii-console");
@@ -509,9 +513,19 @@ function detectIiiConsole(): IiiConsoleState {
 const III_CONSOLE_INSTALL_CMD =
   "curl -fsSL https://install.iii.dev/console/main/install.sh | bash -s -- --next";
 
-async function ensureIiiConsole(): Promise<IiiConsoleState> {
-  const state = detectIiiConsole();
-  if (state.kind === "installed") return state;
+async function ensureIiiConsole(
+  restPort: number,
+  autoStart = true,
+): Promise<IiiConsoleState> {
+  const detected = detectIiiConsole();
+  const state =
+    detected.kind === "installed"
+      ? await startIiiConsole(detected.binPath, restPort, autoStart)
+      : detected;
+  if (state.kind === "installed" || state.kind === "running") return state;
+
+  // Binary exists but start failed — don't prompt to install.
+  if (detected.kind === "installed") return state;
 
   // Non-interactive contexts get the panel hint but no prompt.
   if (!process.stdin.isTTY || process.env["CI"]) return state;
@@ -547,8 +561,117 @@ async function ensureIiiConsole(): Promise<IiiConsoleState> {
     return state;
   }
   // Re-detect rather than trust install-script output paths.
-  return detectIiiConsole();
+  const newState = detectIiiConsole();
+  if (newState.kind === "installed") {
+    return await startIiiConsole(newState.binPath, restPort, autoStart);
+  }
+  return newState;
 }
+
+async function startIiiConsole(
+  binPath: string,
+  restPort: number,
+  autoStart: boolean,
+): Promise<IiiConsoleState> {
+  // If already running, just return current state.
+  if (iiiConsoleProcess && iiiConsoleProcess.exitCode === null) {
+    const port = iiiConsolePortFromProcess(iiiConsoleProcess);
+    if (port != null) {
+      return {
+        kind: "running",
+        binPath,
+        port,
+        pid: iiiConsoleProcess.pid!,
+      };
+    }
+  }
+
+  if (!autoStart) return { kind: "installed", binPath };
+
+  // Pick a port: restPort + 4 (default 3111 + 4 = 3115).
+  const consolePort = restPort + 4;
+
+  // Kill any zombie iii-console holding the port from a previous session.
+  const zombiePids = findEnginePidsByPort(consolePort);
+  for (const pid of zombiePids) {
+    try {
+      process.kill(pid, "SIGKILL");
+      vlog(`Killed zombie iii-console pid ${pid} on :${consolePort}`);
+    } catch {}
+  }
+
+  return new Promise((resolve) => {
+    try {
+      const proc = spawn(binPath, ["--port", String(consolePort)], {
+        stdio: IS_VERBOSE ? "inherit" : "ignore",
+        detached: false,
+      });
+
+      proc.on("error", (err) => {
+        resolve({
+          kind: "error",
+          message: `Failed to start iii-console: ${err.message}`,
+        });
+      });
+
+      // Give it a moment to start or fail.
+      const timeout = setTimeout(() => {
+        if (proc.exitCode != null) {
+          resolve({
+            kind: "error",
+            message: `iii-console exited with code ${proc.exitCode}`,
+          });
+        } else {
+          iiiConsoleProcess = proc;
+          resolve({
+            kind: "running",
+            binPath,
+            port: consolePort,
+            pid: proc.pid!,
+          });
+        }
+      }, 1500);
+
+      proc.on("exit", (code) => {
+        clearTimeout(timeout);
+        if (iiiConsoleProcess === proc) iiiConsoleProcess = null;
+        resolve({
+          kind: "error",
+          message: `iii-console exited with code ${code}`,
+        });
+      });
+    } catch (err: any) {
+      resolve({ kind: "error", message: err.message });
+    }
+  });
+}
+
+function iiiConsolePortFromProcess(_proc: ChildProcess): number | null {
+  // Port is derived from args; this is only called when already running
+  // and we don't have the port stored separately. Return null to force
+  // a fresh start rather than relying on stale state.
+  return null;
+}
+
+function cleanupIiiConsole(): void {
+  if (iiiConsoleProcess && iiiConsoleProcess.exitCode === null) {
+    try {
+      iiiConsoleProcess.kill("SIGTERM");
+    } catch { /* best effort */ }
+    iiiConsoleProcess = null;
+  }
+}
+
+// Register cleanup on exit so we don't leave orphaned iii-console processes.
+process.on("exit", cleanupIiiConsole);
+process.on("SIGINT", () => {
+  cleanupIiiConsole();
+  process.exit(0);
+});
+process.on("SIGTERM", () => {
+  cleanupIiiConsole();
+  process.exit(0);
+});
 
 function adoptRunningEngine(): void {
   try {
@@ -909,16 +1032,18 @@ function printReadyHint(consoleState: IiiConsoleState): void {
   const streamUrl = `ws://${engineHost}:${getStreamPort()}`;
   const engineUrl = `ws://${engineHost}:${getEnginePort()}`;
 
-  const consoleLine =
-    consoleState.kind === "installed"
-      ? // We can't safely probe iii-console's port (default 3113
-        // collides with our viewer) so we surface the binary location
-        // and let the user start it on a port of their choice. Use
-        // the detected binary path so `(run: ...)` is executable as-
-        // is, even when the binary isn't on PATH under the bare
-        // name `iii-console`.
-        `iii console  ${consoleState.binPath}  (run: ${consoleState.binPath} -p <port>)`
-      : `iii console  (install: ${III_CONSOLE_INSTALL_CMD})`;
+  const consoleLine = (() => {
+    switch (consoleState.kind) {
+      case "running":
+        return `iii console  http://localhost:${consoleState.port}  (pid ${consoleState.pid})`;
+      case "installed":
+        return `iii console  ${consoleState.binPath}  (run: ${consoleState.binPath} -p <port>)`;
+      case "error":
+        return `iii console  (start failed: ${consoleState.message})`;
+      default:
+        return `iii console  (install: ${III_CONSOLE_INSTALL_CMD})`;
+    }
+  })();
 
   const lines = [
     `REST API     ${restUrl}`,
@@ -968,7 +1093,7 @@ async function main() {
     if (IS_VERBOSE) p.log.info("Skipping engine check (--no-engine)");
     await import("./index.js");
     if (await waitForAgentmemoryReady(15000)) {
-      const consoleState = await ensureIiiConsole();
+      const consoleState = await ensureIiiConsole(getRestPort());
       await maybeOfferGlobalInstall();
       printReadyHint(consoleState);
     }
@@ -983,7 +1108,7 @@ async function main() {
     adoptRunningEngine();
     await import("./index.js");
     if (await waitForAgentmemoryReady(15000)) {
-      const consoleState = await ensureIiiConsole();
+      const consoleState = await ensureIiiConsole(getRestPort());
       await maybeOfferGlobalInstall();
       printReadyHint(consoleState);
     }
@@ -1056,7 +1181,7 @@ async function main() {
   s.stop("iii-engine is ready");
   await import("./index.js");
   if (await waitForAgentmemoryReady(15000)) {
-    const consoleState = await ensureIiiConsole();
+    const consoleState = await ensureIiiConsole(getRestPort());
     await maybeOfferGlobalInstall();
     printReadyHint(consoleState);
   }
@@ -2158,13 +2283,17 @@ async function runStop(): Promise<void> {
     }
     const survivors = new Set<number>(portPids);
     if (pidfilePid) survivors.add(pidfilePid);
-    p.log.warn(
-      `Engine not responding on :${port}, but ${survivors.size} process(es) still hold the port or pidfile: ${[...survivors].join(", ")}`,
-    );
-    p.log.info(
-      `Preserving ~/.agentmemory/iii.pid. Investigate before manual cleanup:\n  ps -p ${[...survivors].join(",")} -o pid,ppid,comm,etime\n  ${IS_WINDOWS ? "netstat -ano | findstr :" + port : "lsof -i :" + port}`,
+    if (force) {
+      p.log.warn(`--force: ${survivors.size} zombie process(es) on :${port} (HTTP unresponsive). Killing: ${[...survivors].join(", ")}`);
+    } else {
+      p.log.warn(
+        `Engine not responding on :${port}, but ${survivors.size} process(es) still hold the port or pidfile: ${[...survivors].join(", ")}`,
+      );
+      p.log.info(
+        `Preserving ~/.agentmemory/iii.pid. Investigate before manual cleanup:\n  ps -p ${[...survivors].join(",")} -o pid,ppid,comm,etime\n  ${IS_WINDOWS ? "netstat -ano | findstr :" + port : "lsof -i :" + port}`,
     );
     process.exit(1);
+  }
   }
 
   if (!state) {
@@ -2205,11 +2334,62 @@ async function runStop(): Promise<void> {
 
   clearEnginePidfile();
   clearEngineState();
+  cleanupIiiConsole();
   if (!allStopped) {
     p.log.error("One or more engine processes survived SIGKILL. Investigate with `ps`.");
     process.exit(1);
   }
   p.outro("Stopped. Memories persisted to disk; restart anytime with: npx @agentmemory/agentmemory");
+}
+
+async function runRestart(): Promise<void> {
+  p.intro("agentmemory restart");
+
+  const port = getRestPort();
+  const running = await isEngineRunning();
+  const portPids = findEnginePidsByPort(port);
+  const hasZombies = !running && portPids.length > 0;
+
+  if (running || hasZombies) {
+    if (hasZombies) {
+      p.log.warn(
+        `Engine not responding on :${port}, but ${portPids.length} process(es) still hold the port: ${portPids.join(", ")}. Forcing stop before restart.`,
+      );
+    } else {
+      p.log.info("Stopping existing engine before restart...");
+    }
+    const origArgs = args.slice();
+    args.push("--force");
+    try {
+      await runStop();
+    } catch {
+    } finally {
+      args.length = 0;
+      args.push(...origArgs);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+
+  cleanupIiiConsole();
+  clearEnginePidfile();
+  clearEngineState();
+
+  // Kill zombie Viewers across the full fallback range to avoid
+  // accumulated zombies pushing the Viewer to high port numbers.
+  const viewerBase = port + 2;
+  const VIEWER_MAX_RETRIES = 10;
+  for (let offset = 0; offset <= VIEWER_MAX_RETRIES; offset++) {
+    const candidatePort = viewerBase + offset;
+    if (candidatePort === port + 4) continue; // iii-console port
+    for (const pid of findEnginePidsByPort(candidatePort)) {
+      try {
+        process.kill(pid, "SIGKILL");
+        vlog(`Killed zombie Viewer pid ${pid} on :${candidatePort}`);
+      } catch {}
+    }
+  }
+
+  await main();
 }
 
 async function runMcp(): Promise<void> {
@@ -2547,6 +2727,7 @@ const commands: Record<string, () => Promise<void>> = {
   demo: runDemo,
   upgrade: runUpgrade,
   stop: runStop,
+  restart: runRestart,
   remove: runRemove,
   mcp: runMcp,
   "import-jsonl": runImportJsonl,

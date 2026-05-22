@@ -479,14 +479,22 @@ async function main() {
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,
   );
 
-  const viewerPort = config.restPort + 2;
-  const viewerServer = startViewerServer(
-    viewerPort,
-    kv,
-    sdk,
-    secret,
-    config.restPort,
-  );
+  // Only start the Viewer from the CLI process. When imported by the
+  // iii-exec worker (process.argv[1] ends with index.mjs), skip the
+  // Viewer to avoid port collision — the CLI already owns port 3113.
+  const argv1 = process.argv[1] ?? "";
+  const isCliProcess = argv1.includes("cli");
+  let viewerServer: ReturnType<typeof startViewerServer> | null = null;
+  if (isCliProcess) {
+    const viewerPort = config.restPort + 2;
+    viewerServer = startViewerServer(
+      viewerPort,
+      kv,
+      sdk,
+      secret,
+      config.restPort,
+    );
+  }
 
   const autoForgetIntervalMs = parseInt(process.env.AUTO_FORGET_INTERVAL_MS || "3600000", 10);
   const consolidationIntervalMs = parseInt(process.env.CONSOLIDATION_INTERVAL_MS || "7200000", 10);
@@ -535,7 +543,9 @@ async function main() {
     healthMonitor.stop();
     dedupMap.stop();
     indexPersistence.stop();
-    await new Promise<void>((resolve) => viewerServer.close(() => resolve()));
+    if (viewerServer) {
+      await new Promise<void>((resolve) => viewerServer.close(() => resolve()));
+    }
     await indexPersistence.save().catch((err) => {
       console.warn(`[agentmemory] Failed to save index on shutdown:`, err);
     });

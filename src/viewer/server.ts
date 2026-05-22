@@ -240,6 +240,11 @@ export function startViewerServer(
     if (err.code === "EADDRINUSE" && attempt < MAX_VIEWER_PORT_RETRIES) {
       attempt++;
       currentPort = requestedPort + attempt;
+      // Skip the iii-console port (restPort + 4) to avoid collision.
+      if (restPort != null && currentPort === restPort + 4 && attempt < MAX_VIEWER_PORT_RETRIES) {
+        attempt++;
+        currentPort = requestedPort + attempt;
+      }
       setImmediate(tryListen);
       return;
     }
