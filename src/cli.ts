@@ -141,6 +141,7 @@ Commands:
 
 Options:
   --help, -h         Show this help
+  --version, -V      Print version and exit
   --verbose, -v      Show engine stderr, boot log, and diagnostic info
   --reset            Wipe ~/.agentmemory/preferences.json and re-run onboarding
   --tools all|core   Tool visibility (default: core = 7 tools)
@@ -163,6 +164,11 @@ Quick start:
   npx @agentmemory/agentmemory mcp      # standalone MCP server (no engine)
   npx @agentmemory/mcp                  # same as above (shim package)
 `);
+  process.exit(0);
+}
+
+if (args.includes("--version") || args.includes("-V")) {
+  console.log(VERSION);
   process.exit(0);
 }
 
