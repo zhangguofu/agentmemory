@@ -380,73 +380,58 @@ describe("handleToolCall", () => {
     expect(JSON.parse(huge.content[0].text).results).toHaveLength(100);
   });
 
-  it("memory_governance_delete removes memories by id array (#139)", async () => {
+  it("memory_consolidate returns error in local mode", async () => {
     const kv = new InMemoryKV();
-    const a = JSON.parse(
-      (await handleToolCall("memory_save", { content: "one" }, kv)).content[0]
-        .text,
-    );
-    const b = JSON.parse(
-      (await handleToolCall("memory_save", { content: "two" }, kv)).content[0]
-        .text,
-    );
-    const c = JSON.parse(
-      (await handleToolCall("memory_save", { content: "three" }, kv)).content[0]
-        .text,
-    );
+    const result = await handleToolCall("memory_consolidate", {}, kv);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toContain("no local fallback");
+  });
+
+  it("memory_diagnose returns error in local mode", async () => {
+    const kv = new InMemoryKV();
+    const result = await handleToolCall("memory_diagnose", {}, kv);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.error).toContain("no local fallback");
+  });
+
+  it("memory_lesson_save persists lesson to kv and disk", async () => {
+    const kv = new InMemoryKV("/tmp/test-handle.json");
     const result = await handleToolCall(
-      "memory_governance_delete",
-      { memoryIds: [a.saved, c.saved] },
+      "memory_lesson_save",
+      { content: "Always use structured logging", project: "myapp", tags: ["logging", "best-practice"] },
       kv,
     );
     const parsed = JSON.parse(result.content[0].text);
-    expect(parsed.deleted).toBe(2);
-    expect(parsed.requested).toBe(2);
+    expect(parsed.saved).toMatch(/^les_/);
+    expect(writeFileSync).toHaveBeenCalled();
 
-    const remaining = await kv.list<Record<string, unknown>>("mem:memories");
-    expect(remaining).toHaveLength(1);
-    expect((remaining[0] as { id: string }).id).toBe(b.saved);
+    const lesson = await kv.get<{ content: string; project: string; tags: string[] }>(
+      "mem:lessons",
+      parsed.saved,
+    );
+    expect(lesson).toBeDefined();
+    expect(lesson!.content).toBe("Always use structured logging");
+    expect(lesson!.project).toBe("myapp");
+    expect(lesson!.tags).toEqual(["logging", "best-practice"]);
   });
 
-  it("memory_governance_delete accepts CSV-string memoryIds too", async () => {
-    const kv = new InMemoryKV();
-    const saved = JSON.parse(
-      (await handleToolCall("memory_save", { content: "x" }, kv)).content[0]
-        .text,
-    );
-    const result = await handleToolCall(
-      "memory_governance_delete",
-      { memoryIds: saved.saved, reason: "test csv" },
-      kv,
-    );
-    const parsed = JSON.parse(result.content[0].text);
-    expect(parsed.deleted).toBe(1);
-    expect(parsed.reason).toBe("test csv");
-  });
-
-  it("memory_governance_delete throws when memoryIds is missing or empty", async () => {
+  it("memory_lesson_save throws when content is missing", async () => {
     const kv = new InMemoryKV();
     await expect(
-      handleToolCall("memory_governance_delete", {}, kv),
-    ).rejects.toThrow("memoryIds is required");
-    await expect(
-      handleToolCall("memory_governance_delete", { memoryIds: [] }, kv),
-    ).rejects.toThrow("memoryIds is required");
+      handleToolCall("memory_lesson_save", {}, kv),
+    ).rejects.toThrow("content is required");
   });
 
-  it("memory_governance_delete silently skips unknown ids", async () => {
+  it("memory_lesson_save without persist path does not call writeFileSync", async () => {
     const kv = new InMemoryKV();
-    const saved = JSON.parse(
-      (await handleToolCall("memory_save", { content: "real" }, kv)).content[0]
-        .text,
-    );
-    const result = await handleToolCall(
-      "memory_governance_delete",
-      { memoryIds: [saved.saved, "mem_does_not_exist"] },
-      kv,
-    );
+    await handleToolCall("memory_lesson_save", { content: "No disk" }, kv);
+    expect(writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it("memory_reflect returns error in local mode", async () => {
+    const kv = new InMemoryKV();
+    const result = await handleToolCall("memory_reflect", {}, kv);
     const parsed = JSON.parse(result.content[0].text);
-    expect(parsed.deleted).toBe(1);
-    expect(parsed.requested).toBe(2);
+    expect(parsed.error).toContain("no local fallback");
   });
 });
