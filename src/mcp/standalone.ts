@@ -18,9 +18,10 @@ const IMPLEMENTED_TOOLS = new Set([
   "memory_recall",
   "memory_smart_search",
   "memory_sessions",
-  "memory_export",
-  "memory_audit",
-  "memory_governance_delete",
+  "memory_consolidate",
+  "memory_diagnose",
+  "memory_lesson_save",
+  "memory_reflect",
 ]);
 
 const SERVER_INFO = {
@@ -89,8 +90,13 @@ interface Validated {
   files?: string[];
   query?: string;
   limit?: number;
-  memoryIds?: string[];
-  reason?: string;
+  tier?: string;
+  categories?: string;
+  project?: string;
+  context?: string;
+  tags?: string[];
+  confidence?: number;
+  maxClusters?: number;
 }
 
 function validate(toolName: string, args: Record<string, unknown>): Validated {
@@ -124,17 +130,29 @@ function validate(toolName: string, args: Record<string, unknown>): Validated {
       v.limit = parseLimit(args["limit"], 20);
       return v;
     }
-    case "memory_governance_delete": {
-      const ids = normalizeList(args["memoryIds"]);
-      if (ids.length === 0) throw new Error("memoryIds is required");
-      v.memoryIds = ids;
-      v.reason = (args["reason"] as string) || "plugin skill request";
+    case "memory_consolidate": {
+      v.tier = (args["tier"] as string) || undefined;
       return v;
     }
-    case "memory_export":
+    case "memory_diagnose": {
+      v.categories = (args["categories"] as string) || undefined;
       return v;
-    case "memory_audit": {
-      v.limit = parseLimit(args["limit"], 50);
+    }
+    case "memory_lesson_save": {
+      const content = args["content"];
+      if (typeof content !== "string" || !content.trim()) {
+        throw new Error("content is required");
+      }
+      v.content = content;
+      v.project = (args["project"] as string) || undefined;
+      v.context = (args["context"] as string) || undefined;
+      v.tags = normalizeList(args["tags"]);
+      v.confidence = typeof args["confidence"] === "number" ? args["confidence"] : undefined;
+      return v;
+    }
+    case "memory_reflect": {
+      v.project = (args["project"] as string) || undefined;
+      v.maxClusters = parseLimit(args["maxClusters"], 10);
       return v;
     }
     default:
@@ -174,22 +192,41 @@ async function handleProxy(
       );
       return textResponse(result, true);
     }
-    case "memory_governance_delete": {
-      const result = await handle.call("/agentmemory/governance/memories", {
-        method: "DELETE",
-        body: JSON.stringify({ memoryIds: v.memoryIds, reason: v.reason }),
+    case "memory_consolidate": {
+      const result = await handle.call("/agentmemory/consolidate", {
+        method: "POST",
+        body: JSON.stringify({ tier: v.tier }),
       });
       return textResponse(result);
     }
-    case "memory_export": {
-      const result = await handle.call("/agentmemory/export", { method: "GET" });
+    case "memory_diagnose": {
+      const result = await handle.call("/agentmemory/diagnose", {
+        method: "POST",
+        body: JSON.stringify({ categories: v.categories }),
+      });
       return textResponse(result, true);
     }
-    case "memory_audit": {
-      const result = await handle.call(
-        `/agentmemory/audit?limit=${v.limit}`,
-        { method: "GET" },
-      );
+    case "memory_lesson_save": {
+      const result = await handle.call("/agentmemory/lessons", {
+        method: "POST",
+        body: JSON.stringify({
+          content: v.content,
+          project: v.project,
+          context: v.context,
+          tags: v.tags,
+          confidence: v.confidence,
+        }),
+      });
+      return textResponse(result);
+    }
+    case "memory_reflect": {
+      const result = await handle.call("/agentmemory/reflect", {
+        method: "POST",
+        body: JSON.stringify({
+          project: v.project,
+          maxClusters: v.maxClusters,
+        }),
+      });
       return textResponse(result, true);
     }
     default:
@@ -254,39 +291,37 @@ async function handleLocal(
       return textResponse({ sessions: sessions.slice(0, limit) }, true);
     }
 
-    case "memory_governance_delete": {
-      let deleted = 0;
-      for (const id of v.memoryIds || []) {
-        const existing = await kvInstance.get("mem:memories", id);
-        if (existing) {
-          await kvInstance.delete("mem:memories", id);
-          deleted++;
-        }
-      }
-      kvInstance.persist();
+    case "memory_consolidate":
       return textResponse({
-        deleted,
-        requested: (v.memoryIds || []).length,
-        reason: v.reason,
+        error: "memory_consolidate requires a running agentmemory server (no local fallback)",
       });
+
+    case "memory_diagnose":
+      return textResponse({
+        error: "memory_diagnose requires a running agentmemory server (no local fallback)",
+      });
+
+    case "memory_lesson_save": {
+      const id = generateId("les");
+      const isoNow = new Date().toISOString();
+      await kvInstance.set("mem:lessons", id, {
+        id,
+        content: v.content,
+        project: v.project,
+        context: v.context,
+        tags: v.tags,
+        confidence: v.confidence ?? 0.5,
+        createdAt: isoNow,
+        updatedAt: isoNow,
+      });
+      kvInstance.persist();
+      return textResponse({ saved: id });
     }
 
-    case "memory_export": {
-      const memories = await kvInstance.list("mem:memories");
-      const sessions = await kvInstance.list("mem:sessions");
-      return textResponse({ version: VERSION, memories, sessions }, true);
-    }
-
-    case "memory_audit": {
-      const entries = await kvInstance.list("mem:audit");
-      const limit = v.limit ?? 50;
-      return textResponse(
-        {
-          entries: (entries as Array<Record<string, unknown>>).slice(0, limit),
-        },
-        true,
-      );
-    }
+    case "memory_reflect":
+      return textResponse({
+        error: "memory_reflect requires a running agentmemory server (no local fallback)",
+      });
 
     default:
       throw new Error(`Unknown tool: ${v.tool}`);
